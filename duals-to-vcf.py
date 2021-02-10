@@ -18,7 +18,7 @@ def make_argparser():
   options.add_argument('bam', type=pathlib.Path)
   options.add_argument('fq1', type=pathlib.Path)
   options.add_argument('fq2', type=pathlib.Path)
-  options.add_argument('-r', '--refname')
+  options.add_argument('-o', '--outformat', choices=('vcf', 'tsv'), default='tsv')
   options.add_argument('-h', '--help', action='help',
     help='Print this argument help text and exit.')
   logs = parser.add_argument_group('Logging')
@@ -43,7 +43,9 @@ def main(argv):
   for mate, dual_reads in enumerate(dual_readses, 1):
     logging.info(f'Info: Mate {mate}: {len(dual_reads)} reads with dual bases.')
 
-  print(create_header(args.refname))
+  if args.outformat == 'vcf':
+    print(create_header(args.refname))
+
   nones = 0
   for read, align, duals in get_dual_data(args.bam, dual_readses):
     for read_coord, ref_coord, read_base, align_base in duals:
@@ -52,7 +54,10 @@ def main(argv):
         continue
       # print(align.qname, align.rname, ref_coord, read_base, sep='\t')
       alt1, alt2 = DUAL_BASES[read_base]
-      print(align.rname, ref_coord, '.', alt1, alt2, '.', '.', '.', '.', '.', sep='\t')
+      if args.outformat == 'vcf':
+        print(align.rname, ref_coord, '.', alt1, alt2, '.', '.', '.', '.', '.', sep='\t')
+      elif args.outformat == 'tsv':
+        print(align.rname, read.id, ref_coord, read_coord, alt1, alt2, sep='\t')
   logging.info(f'Info: {nones} dual bases without a reference coordinate.')
 
 
@@ -67,17 +72,17 @@ def get_dual_reads_dict(fq_path):
   return {read.id: read for read in get_dual_reads(getreads.getparser(fq_path, 'fastq'))}
 
 
+def get_dual_reads(reads):
+  for read in reads:
+    if seq_has_duals(read.seq):
+      yield read
+
+
 def seq_has_duals(seq):
   for base in seq:
     if base in DUAL_BASES:
       return True
   return False
-
-
-def get_dual_reads(reads):
-  for read in reads:
-    if seq_has_duals(read.seq):
-      yield read
 
 
 def get_matched_reads_and_alignments(bam_path, dual_readses):
