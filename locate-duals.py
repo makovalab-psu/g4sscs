@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import collections
 import datetime
 import logging
 import pathlib
@@ -46,22 +47,39 @@ def main(argv):
   if args.outformat == 'vcf':
     print(create_header(args.refname))
 
-  nones = 0
-  for read, align, duals in get_dual_data(args.bam, dual_readses):
+  missing = found = 0
+  for dual_data, read, align in collate_dual_data(args.bam, dual_readses):
+    if dual_data.ref_coord is None:
+      missing += 1
+      continue
+    else:
+      found += 1
+    print(dual_data.format(args.outformat))
+  logging.info(f'Info: {found} dual bases with a reference coordinate, {missing} without.')
+
+
+DUAL_DATA_FIELDS = ('ref_name', 'read_id', 'ref_coord', 'read_coord', 'alt1', 'alt2')
+class DualData(collections.namedtuple('DualData', DUAL_DATA_FIELDS)):
+  __slots__ = ()
+  def format(self, format_):
+    if format_ == 'vcf':
+      strs = (self.ref_name, str(self.ref_coord), '.', self.alt1, self.alt2, '.', '.', '.', '.', '.')
+    elif format_ == 'tsv':
+      strs = (
+        self.ref_name, self.read_id, str(self.ref_coord), str(self.read_coord), self.alt1, self.alt2
+      )
+    return '\t'.join(strs)
+
+
+def collate_dual_data(bam_path, dual_readses):
+  for read, align, duals in get_raw_dual_data(bam_path, dual_readses):
     for read_coord, ref_coord, read_base, align_base in duals:
-      if ref_coord is None:
-        nones += 1
-        continue
-      # print(align.qname, align.rname, ref_coord, read_base, sep='\t')
       alt1, alt2 = DUAL_BASES[read_base]
-      if args.outformat == 'vcf':
-        print(align.rname, ref_coord, '.', alt1, alt2, '.', '.', '.', '.', '.', sep='\t')
-      elif args.outformat == 'tsv':
-        print(align.rname, read.id, ref_coord, read_coord, alt1, alt2, sep='\t')
-  logging.info(f'Info: {nones} dual bases without a reference coordinate.')
+      dual_data = DualData(align.rname, read.id, ref_coord, read_coord, alt1, alt2)
+      yield dual_data, read, align
 
 
-def get_dual_data(bam_path, dual_readses):
+def get_raw_dual_data(bam_path, dual_readses):
   for read, align in get_matched_reads_and_alignments(bam_path, dual_readses):
     duals = match_duals_with_ns(read, align)
     if duals:
