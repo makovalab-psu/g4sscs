@@ -57,24 +57,29 @@ def main(argv):
   logging.info(f'Info: {found} dual bases with a reference coordinate, {missing} without.')
 
 
-DUAL_DATA_FIELDS = ('ref_name', 'read_id', 'ref_coord', 'read_coord', 'alt1', 'alt2')
+DUAL_DATA_FIELDS = ('ref_name', 'read_id', 'mate', 'ref_coord', 'read_coord', 'alt1', 'alt2')
 class DualData(collections.namedtuple('DualData', DUAL_DATA_FIELDS)):
   __slots__ = ()
+  @classmethod
+  def from_raw(cls, raw_dual, align, read):
+    read_coord, ref_coord, read_base, align_base = raw_dual
+    alt1, alt2 = DUAL_BASES[read_base]
+    return cls(align.rname, read.id, align.mate, ref_coord, read_coord, alt1, alt2)
   def format(self, format_):
     if format_ == 'vcf':
       strs = (self.ref_name, str(self.ref_coord), '.', self.alt1, self.alt2, '.', '.', '.', '.', '.')
     elif format_ == 'tsv':
       strs = (
-        self.ref_name, self.read_id, str(self.ref_coord), str(self.read_coord), self.alt1, self.alt2
+        self.ref_name, self.read_id, str(self.mate), str(self.ref_coord), str(self.read_coord),
+        self.alt1, self.alt2
       )
     return '\t'.join(strs)
 
 
 def collate_dual_data(bam_path, dual_readses):
-  for read, align, duals in get_raw_dual_data(bam_path, dual_readses):
-    for read_coord, ref_coord, read_base, align_base in duals:
-      alt1, alt2 = DUAL_BASES[read_base]
-      dual_data = DualData(align.rname, read.id, ref_coord, read_coord, alt1, alt2)
+  for read, align, raw_duals in get_raw_dual_data(bam_path, dual_readses):
+    for raw_dual in raw_duals:
+      dual_data = DualData.from_raw(raw_dual, align, read)
       yield dual_data, read, align
 
 
@@ -103,29 +108,45 @@ def seq_has_duals(seq):
 
 
 def get_matched_reads_and_alignments(bam_path, dual_readses):
+  stats = collections.Counter()
   for align in samreader.read_bam(bam_path):
+    if align.secondary:
+      stats['secondary'] += 1
+      continue
+    elif align.duplicate:
+      stats['duplicate'] += 1
+      continue
+    elif align.supplemental:
+      stats['supplemental'] += 1
+      continue
     try:
       read = dual_readses[align.mate-1][align.qname]
     except KeyError:
       continue
     yield read, align
+  for key, count in stats.items():
+    if count > 0:
+      logging.info(f'Info: Skipped {count} {key} alignments.')
 
 
 def match_duals_with_ns(read, align):
-  # The sequences in the SAM file are always in reference orientation.
-  # This makes sure the read is as well.
+  read_seq = read.seq.upper()
+  align_seq_raw = get_padded_seq(align).upper()
   if align.reverse:
-    read_seq = get_revcomp(read.seq.upper())
+    align_seq = get_revcomp(align_seq_raw)
   else:
-    read_seq = read.seq.upper()
-  align_seq = get_padded_seq(align).upper()
+    align_seq = align_seq_raw
   if len(read_seq) != len(align_seq):
     raise RuntimeError(
       f'Read {read.name} has a different computed length than alignment {align.qname} '
       f'({align.cigar}):\n  {read_seq}\n  {align_seq}'
     )
   duals = []
-  for read_coord, (read_base, align_base) in enumerate(zip(read_seq, align_seq), 1):
+  for i, (read_base, align_base) in enumerate(zip(read_seq, align_seq)):
+    if align.reverse:
+      read_coord = len(read_seq) - i
+    else:
+      read_coord = i + 1
     ref_coord = align.to_ref_coord(read_coord)
     if read_base != align_base and align_base != '*':
       if read_base in DUAL_BASES and align_base == 'N':
