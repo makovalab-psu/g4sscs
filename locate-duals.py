@@ -51,10 +51,9 @@ def main(argv):
   for dual_data, read, align in collate_dual_data(args.bam, dual_readses):
     if dual_data.ref_coord is None:
       missing += 1
-      continue
     else:
       found += 1
-    print(dual_data.format(args.outformat))
+      print(dual_data.format(args.outformat))
   logging.info(f'Info: {found} dual bases with a reference coordinate, {missing} without.')
 
 
@@ -113,6 +112,8 @@ def get_matched_reads_and_alignments(bam_path, dual_readses):
 
 
 def match_duals_with_ns(read, align):
+  # The sequences in the SAM file are always in reference orientation.
+  # This makes sure the read is as well.
   if align.reverse:
     read_seq = get_revcomp(read.seq.upper())
   else:
@@ -126,28 +127,28 @@ def match_duals_with_ns(read, align):
   duals = []
   for read_coord, (read_base, align_base) in enumerate(zip(read_seq, align_seq), 1):
     ref_coord = align.to_ref_coord(read_coord)
-    if read_base != align_base and align_base != 'H':
+    if read_base != align_base and align_base != '*':
       if read_base in DUAL_BASES and align_base == 'N':
         duals.append((read_coord, ref_coord, read_base, align_base))
       else:
         raise RuntimeError(
           f'Read {read.name} has an unexpected discrepancy with alignment {align.qname}: '
-          f'{read_coord} ({read_coord}) != {align_base} ({ref_coord})'
+          f'{read_base} ({read_coord}) != {align_base} ({ref_coord})'
         )
   return duals
 
 
 def get_padded_seq(align):
-  """Replace hard-clipped bases with 'H' and return a sequence the length of the original read."""
+  """Replace hard-clipped bases with '*' and return a sequence the length of the original read."""
   align_seq = align.seq
   if align._cigar_list:
     oplen, op = align._cigar_list[0]
     if op == 'H':
-      align_seq = 'H'*oplen + align_seq
+      align_seq = '*'*oplen + align_seq
     if len(align._cigar_list) > 1:
       oplen, op = align._cigar_list[-1]
       if op == 'H':
-        align_seq += 'H'*oplen
+        align_seq += '*'*oplen
   return align_seq
 
 
