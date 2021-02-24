@@ -8,6 +8,7 @@ import sys
 from bfx import getreads
 from bfx import samreader
 
+PAD_CHAR = '*'
 DUAL_BASES = {'R':'AG', 'Y':'CT', 'S':'GC', 'W':'AT', 'K':'GT', 'M':'AC'}
 REVCOMP_TABLE = str.maketrans('acgtrymkbdhvACGTRYMKBDHV', 'tgcayrkmvhdbTGCAYRKMVHDB')
 DESCRIPTION = """Correlate ambiguous bases in reads with their positions in alignments."""
@@ -48,23 +49,27 @@ def main(argv):
     print(create_header(args.refname))
 
   missing = found = 0
-  for dual_data, read, align in collate_dual_data(args.bam, dual_readses):
-    if dual_data.ref_coord is None:
+  for read, align, dual in get_duals(args.bam, dual_readses):
+    if dual.ref_coord is None:
       missing += 1
     else:
       found += 1
-      print(dual_data.format(args.outformat))
+      print(dual.format(args.outformat))
   logging.info(f'Info: {found} dual bases with a reference coordinate, {missing} without.')
 
 
-DUAL_DATA_FIELDS = ('ref_name', 'read_id', 'mate', 'ref_coord', 'read_coord', 'alt1', 'alt2')
-class DualData(collections.namedtuple('DualData', DUAL_DATA_FIELDS)):
+DUAL_FIELDS = ('ref_name', 'read_id', 'mate', 'ref_coord', 'read_coord', 'alt1', 'alt2')
+class Dual(collections.namedtuple('Dual', DUAL_FIELDS)):
   __slots__ = ()
   @classmethod
-  def from_raw(cls, raw_dual, align, read):
+  def from_raw(cls, raw_dual, read, align):
     read_coord, ref_coord, read_base, align_base = raw_dual
     alt1, alt2 = DUAL_BASES[read_base]
     return cls(align.rname, read.id, align.mate, ref_coord, read_coord, alt1, alt2)
+  @classmethod
+  def from_raws(cls, raw_duals, read, align):
+    for raw_dual in raw_duals:
+      yield cls.from_raw(raw_dual, read, align)
   def format(self, format_):
     if format_ == 'vcf':
       strs = (self.ref_name, str(self.ref_coord), '.', self.alt1, self.alt2, '.', '.', '.', '.', '.')
@@ -76,16 +81,22 @@ class DualData(collections.namedtuple('DualData', DUAL_DATA_FIELDS)):
     return '\t'.join(strs)
 
 
-def collate_dual_data(bam_path, dual_readses):
-  for read, align, raw_duals in get_raw_dual_data(bam_path, dual_readses):
-    for raw_dual in raw_duals:
-      dual_data = DualData.from_raw(raw_dual, align, read)
-      yield dual_data, read, align
+def get_duals(bam_path, dual_readses):
+  for read, align, duals in get_duals_per_read(bam_path, dual_readses):
+    for dual in duals:
+      yield read, align, dual
 
 
-def get_raw_dual_data(bam_path, dual_readses):
+def get_duals_per_read(bam_path, dual_readses):
   for read, align in get_matched_reads_and_alignments(bam_path, dual_readses):
-    duals = match_duals_with_ns(read, align)
+    try:
+      duals = list(Dual.from_raws(filter_for_duals(*align_sites(read, align)), read, align))
+    except RuntimeError:
+      logging.critical(
+        f'Error comparing read {read.name} with alignment {align.qname}/{align.mate} '
+        f'({align.cigar})'
+      )
+      raise
     if duals:
       yield read, align, duals
 
@@ -129,47 +140,52 @@ def get_matched_reads_and_alignments(bam_path, dual_readses):
       logging.info(f'Info: Skipped {count} {key} alignments.')
 
 
-def match_duals_with_ns(read, align):
+def align_sites(read, align):
+  read_coords = list(range(1, len(read.seq)+1))
+  ref_coords = [align.to_ref_coord(coord) for coord in read_coords]
   read_seq = read.seq.upper()
-  align_seq_raw = get_padded_seq(align).upper()
+  align_seq_padded = get_padded_seq(align).upper()
   if align.reverse:
-    align_seq = get_revcomp(align_seq_raw)
+    read_bases = get_complement(read_seq)
+    align_bases = ''.join(reversed(align_seq_padded))
   else:
-    align_seq = align_seq_raw
-  if len(read_seq) != len(align_seq):
+    read_bases = read_seq
+    align_bases = align_seq_padded
+  if not len(read_coords) == len(ref_coords) == len(read_bases) == len(align_bases):
     raise RuntimeError(
-      f'Read {read.name} has a different computed length than alignment {align.qname} '
-      f'({align.cigar}):\n  {read_seq}\n  {align_seq}'
+      f'Read has a different computed length than alignment:\n'
+      f'  {read_seq}\n'
+      f'  {align_seq_padded}'
     )
-  duals = []
-  for i, (read_base, align_base) in enumerate(zip(read_seq, align_seq)):
-    if align.reverse:
-      read_coord = len(read_seq) - i
-    else:
-      read_coord = i + 1
-    ref_coord = align.to_ref_coord(read_coord)
-    if read_base != align_base and align_base != '*':
+  return read_coords, ref_coords, read_bases, align_bases
+
+
+def filter_for_duals(read_coords, ref_coords, read_bases, align_bases):
+  for read_coord, ref_coord, read_base, align_base in zip(
+    read_coords, ref_coords, read_bases, align_bases
+  ):
+    if read_base != align_base and align_base != PAD_CHAR:
       if read_base in DUAL_BASES and align_base == 'N':
-        duals.append((read_coord, ref_coord, read_base, align_base))
+        yield read_coord, ref_coord, read_base, align_base
       else:
         raise RuntimeError(
-          f'Read {read.name} has an unexpected discrepancy with alignment {align.qname}: '
+          f'Read has an unexpected discrepancy with alignment: '
           f'{read_base} ({read_coord}) != {align_base} ({ref_coord})'
         )
-  return duals
 
 
 def get_padded_seq(align):
-  """Replace hard-clipped bases with '*' and return a sequence the length of the original read."""
+  """Replace hard-clipped bases with PAD_CHAR and return a sequence the length of the original read.
+  """
   align_seq = align.seq
   if align._cigar_list:
     oplen, op = align._cigar_list[0]
     if op == 'H':
-      align_seq = '*'*oplen + align_seq
+      align_seq = PAD_CHAR*oplen + align_seq
     if len(align._cigar_list) > 1:
       oplen, op = align._cigar_list[-1]
       if op == 'H':
-        align_seq += '*'*oplen
+        align_seq += PAD_CHAR*oplen
   return align_seq
 
 
@@ -196,8 +212,24 @@ def print_read_by_alignment(read, align, read_seq, align_seq):
     print(f'{ref_coord_str} ← {read_coord:3d}: {align_base} ← {read_base}')
 
 
+def parse_tsv(lines):
+  for line_raw in lines:
+    raw_values = line_raw.rstrip('\r\n').split('\t')
+    values = []
+    for field, raw_value in zip(Dual._fields, raw_values):
+      if field in ('mate', 'ref_coord', 'read_coord'):
+        values.append(int(raw_value))
+      else:
+        values.append(raw_value)
+    yield Dual(*values)
+
+
+def get_complement(seq):
+  return seq.translate(REVCOMP_TABLE)
+
+
 def get_revcomp(seq):
-  return seq.translate(REVCOMP_TABLE)[::-1]
+  return get_complement(seq)[::-1]
 
 
 def fail(message):
