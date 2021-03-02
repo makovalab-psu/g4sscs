@@ -7,9 +7,9 @@ import pathlib
 import sys
 from bfx import getreads
 from bfx import samreader
+import duallib
 
 PAD_CHAR = '*'
-DUAL_BASES = {'R':'AG', 'Y':'CT', 'S':'GC', 'W':'AT', 'K':'GT', 'M':'AC'}
 REVCOMP_TABLE = str.maketrans('acgtrymkbdhvACGTRYMKBDHV', 'tgcayrkmvhdbTGCAYRKMVHDB')
 DESCRIPTION = """Correlate ambiguous bases in reads with their positions in alignments."""
 
@@ -20,7 +20,6 @@ def make_argparser():
   options.add_argument('bam', type=pathlib.Path)
   options.add_argument('fq1', type=pathlib.Path)
   options.add_argument('fq2', type=pathlib.Path)
-  options.add_argument('-o', '--outformat', choices=('vcf', 'tsv'), default='tsv')
   options.add_argument('-h', '--help', action='help',
     help='Print this argument help text and exit.')
   logs = parser.add_argument_group('Logging')
@@ -45,40 +44,14 @@ def main(argv):
   for mate, dual_reads in enumerate(dual_readses, 1):
     logging.info(f'Info: Mate {mate}: {len(dual_reads)} reads with dual bases.')
 
-  if args.outformat == 'vcf':
-    print(create_header(args.refname))
-
   missing = found = 0
   for read, align, dual in get_duals(args.bam, dual_readses):
     if dual.ref_coord is None:
       missing += 1
     else:
       found += 1
-      print(dual.format(args.outformat))
+      print(dual.format())
   logging.info(f'Info: {found} dual bases with a reference coordinate, {missing} without.')
-
-
-DUAL_FIELDS = ('ref_name', 'read_id', 'mate', 'ref_coord', 'read_coord', 'alt1', 'alt2')
-class Dual(collections.namedtuple('Dual', DUAL_FIELDS)):
-  __slots__ = ()
-  @classmethod
-  def from_raw(cls, raw_dual, read, align):
-    read_coord, ref_coord, read_base, align_base = raw_dual
-    alt1, alt2 = DUAL_BASES[read_base]
-    return cls(align.rname, read.id, align.mate, ref_coord, read_coord, alt1, alt2)
-  @classmethod
-  def from_raws(cls, raw_duals, read, align):
-    for raw_dual in raw_duals:
-      yield cls.from_raw(raw_dual, read, align)
-  def format(self, format_):
-    if format_ == 'vcf':
-      strs = (self.ref_name, str(self.ref_coord), '.', self.alt1, self.alt2, '.', '.', '.', '.', '.')
-    elif format_ == 'tsv':
-      strs = (
-        self.ref_name, self.read_id, str(self.mate), str(self.ref_coord), str(self.read_coord),
-        self.alt1, self.alt2
-      )
-    return '\t'.join(strs)
 
 
 def get_duals(bam_path, dual_readses):
@@ -90,7 +63,7 @@ def get_duals(bam_path, dual_readses):
 def get_duals_per_read(bam_path, dual_readses):
   for read, align in get_matched_reads_and_alignments(bam_path, dual_readses):
     try:
-      duals = list(Dual.from_raws(filter_for_duals(*align_sites(read, align)), read, align))
+      duals = list(duallib.Dual.from_raws(filter_for_duals(*align_sites(read, align)), read, align))
     except RuntimeError:
       logging.critical(
         f'Error comparing read {read.name} with alignment {align.qname}/{align.mate} '
@@ -102,20 +75,7 @@ def get_duals_per_read(bam_path, dual_readses):
 
 
 def get_dual_reads_dict(fq_path):
-  return {read.id: read for read in get_dual_reads(getreads.getparser(fq_path, 'fastq'))}
-
-
-def get_dual_reads(reads):
-  for read in reads:
-    if seq_has_duals(read.seq):
-      yield read
-
-
-def seq_has_duals(seq):
-  for base in seq:
-    if base in DUAL_BASES:
-      return True
-  return False
+  return {read.id: read for read in duallib.get_dual_reads(getreads.getparser(fq_path, 'fastq'))}
 
 
 def get_matched_reads_and_alignments(bam_path, dual_readses):
@@ -165,7 +125,7 @@ def filter_for_duals(read_coords, ref_coords, read_bases, align_bases):
     read_coords, ref_coords, read_bases, align_bases
   ):
     if read_base != align_base and align_base != PAD_CHAR:
-      if read_base in DUAL_BASES and align_base == 'N':
+      if read_base in duallib.DUAL_BASES and align_base == 'N':
         yield read_coord, ref_coord, read_base, align_base
       else:
         raise RuntimeError(
@@ -189,19 +149,6 @@ def get_padded_seq(align):
   return align_seq
 
 
-def create_header(refname=None):
-  dt = datetime.datetime.now()
-  lines = [
-    '##fileformat=VCFv4.0',
-    f'##fileDate={dt.year}{dt.month:02d}{dt.day:02d}',
-    '##source=ambig-to-vcf.py'
-  ]
-  if refname:
-    lines.append(f'##reference={refname}')
-  lines.append('#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tsample')
-  return '\n'.join(lines)
-
-
 def print_read_by_alignment(read, align, read_seq, align_seq):
   for read_coord, (read_base, align_base) in enumerate(zip(read_seq, align_seq), 1):
     ref_coord = align.to_ref_coord(read_coord)
@@ -210,18 +157,6 @@ def print_read_by_alignment(read, align, read_seq, align_seq):
     else:
       ref_coord_str = f'{ref_coord:4d}'
     print(f'{ref_coord_str} ← {read_coord:3d}: {align_base} ← {read_base}')
-
-
-def parse_tsv(lines):
-  for line_raw in lines:
-    raw_values = line_raw.rstrip('\r\n').split('\t')
-    values = []
-    for field, raw_value in zip(Dual._fields, raw_values):
-      if field in ('mate', 'ref_coord', 'read_coord'):
-        values.append(int(raw_value))
-      else:
-        values.append(raw_value)
-    yield Dual(*values)
 
 
 def get_complement(seq):
